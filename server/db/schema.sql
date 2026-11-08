@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash VARCHAR(100) NOT NULL,
   created_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uq_users_email (email)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /*T![auto_id_cache] AUTO_ID_CACHE=1 */;
 
 -- One wallet per user, plus one SYSTEM wallet that money enters the platform from
 -- (top-ups are debited from it). Only the SYSTEM wallet may go negative.
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS wallets (
   CONSTRAINT fk_wallets_user FOREIGN KEY (user_id) REFERENCES users(id),
   -- Last line of defence: a user wallet can never be overdrawn, even if app code has a bug.
   CONSTRAINT chk_wallet_non_negative CHECK (kind = 'SYSTEM' OR balance_paise >= 0)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /*T![auto_id_cache] AUTO_ID_CACHE=1 */;
 
 -- One row per money movement (a top-up or a transfer).
 CREATE TABLE IF NOT EXISTS transactions (
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   CONSTRAINT fk_tx_to   FOREIGN KEY (to_wallet_id)   REFERENCES wallets(id),
   CONSTRAINT chk_tx_amount_positive CHECK (amount_paise > 0),
   CONSTRAINT chk_tx_different_wallets CHECK (from_wallet_id <> to_wallet_id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /*T![auto_id_cache] AUTO_ID_CACHE=1 */;
 
 -- Double-entry ledger: every transaction writes exactly one DEBIT and one CREDIT
 -- of the same amount, so money is never created or destroyed. Rows are append-only.
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   CONSTRAINT fk_ledger_tx     FOREIGN KEY (transaction_id) REFERENCES transactions(id),
   CONSTRAINT fk_ledger_wallet FOREIGN KEY (wallet_id)      REFERENCES wallets(id),
   CONSTRAINT chk_ledger_amount_positive CHECK (amount_paise > 0)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /*T![auto_id_cache] AUTO_ID_CACHE=1 */;
 
 -- Idempotency: the client sends an Idempotency-Key header with every payment.
 -- The UNIQUE key is what makes a retried request run at most once.
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   created_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uq_idem_user_key (user_id, idem_key),
   CONSTRAINT fk_idem_user FOREIGN KEY (user_id) REFERENCES users(id)
-) ENGINE=InnoDB;
+) ENGINE=InnoDB /*T![auto_id_cache] AUTO_ID_CACHE=1 */;
 
 -- The platform's funding wallet (always id 1).
 INSERT IGNORE INTO wallets (id, user_id, kind, balance_paise) VALUES (1, NULL, 'SYSTEM', 0);

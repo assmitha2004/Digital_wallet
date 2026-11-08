@@ -42,7 +42,7 @@ export function runIdempotent({ userId, key, route, body }, work) {
       } catch (err) {
         if (err.code !== 'ER_DUP_ENTRY') throw err;
         const [rows] = await conn.execute(
-          'SELECT request_hash, response_code, response_body FROM idempotency_keys WHERE user_id = ? AND idem_key = ? FOR SHARE',
+          'SELECT request_hash, response_code, response_body FROM idempotency_keys WHERE user_id = ? AND idem_key = ? FOR UPDATE',
           [userId, key],
         );
         const saved = rows[0];
