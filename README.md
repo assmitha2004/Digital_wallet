@@ -12,7 +12,7 @@ arrive at the same moment or a client retries after a timeout.
 ![Vitest](https://img.shields.io/badge/Vitest-6E9F18?logo=vitest&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
 
-**Live demo:** _add your Vercel link here_ · demo login `demo@payledger.dev` / `demo12345`
+**Live demo:** https://digital-wallet-coral-theta.vercel.app · demo login `demo@payledger.dev` / `demo12345`
 
 <img src="docs/screenshots/dashboard.png" alt="PayLedger dashboard" width="860">
 
