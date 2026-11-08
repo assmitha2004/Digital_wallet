@@ -8,10 +8,21 @@ function required(name, fallback) {
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Hosted providers often hand out a connection string ending in a system schema (TiDB: "/sys").
+// The app must never write there, so in that case (or when no database is named) use "payledger".
+const SYSTEM_SCHEMAS = new Set(['', 'sys', 'mysql', 'information_schema', 'performance_schema', 'test']);
+export function resolveDatabaseUrl(rawUrl) {
+  const url = new URL(rawUrl);
+  const name = decodeURIComponent(url.pathname.replace(/^\//, ''));
+  if (process.env.DB_NAME) url.pathname = `/${process.env.DB_NAME}`;
+  else if (SYSTEM_SCHEMAS.has(name.toLowerCase())) url.pathname = '/payledger';
+  return url.toString();
+}
+
 export const config = {
   isProduction,
   port: Number(process.env.PORT ?? 4000),
-  databaseUrl: required('DATABASE_URL', 'mysql://root:root@localhost:3306/payledger'),
+  databaseUrl: resolveDatabaseUrl(required('DATABASE_URL', 'mysql://root:root@localhost:3306/payledger')),
   // Hosted MySQL (Aiven, PlanetScale, TiDB ...) needs TLS. DB_CA_CERT is the PEM text if the
   // provider uses its own certificate authority.
   dbSsl: process.env.DB_SSL === 'true',

@@ -4,12 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mysql from 'mysql2/promise';
-import { config } from '../src/config.js';
+import { config, resolveDatabaseUrl } from '../src/config.js';
 
 const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../db/schema.sql');
 
 export async function migrate(databaseUrl = config.databaseUrl) {
-  const url = new URL(databaseUrl);
+  const url = new URL(resolveDatabaseUrl(databaseUrl));
   const database = decodeURIComponent(url.pathname.slice(1));
   if (!/^[A-Za-z0-9_]+$/.test(database)) throw new Error(`Put a database name at the end of DATABASE_URL (got "${database}")`);
 

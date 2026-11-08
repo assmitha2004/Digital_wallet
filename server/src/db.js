@@ -8,8 +8,16 @@ function sslOptions() {
     : { rejectUnauthorized: true };
 }
 
+// Parse the URL ourselves so provider-specific query options (e.g. TiDB's "?ssl=...") cannot
+// silently override the TLS settings below.
+const dbUrl = new URL(config.databaseUrl);
+
 export const pool = mysql.createPool({
-  uri: config.databaseUrl,
+  host: dbUrl.hostname,
+  port: Number(dbUrl.port || 3306),
+  user: decodeURIComponent(dbUrl.username),
+  password: decodeURIComponent(dbUrl.password),
+  database: decodeURIComponent(dbUrl.pathname.slice(1)),
   connectionLimit: config.dbPoolSize,
   waitForConnections: true,
   timezone: 'Z',
