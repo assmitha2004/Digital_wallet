@@ -180,11 +180,26 @@ CI (GitHub Actions) runs the tests, the race demo and the frontend build against
 
 ## Deploy to Vercel
 
-1. Create a free MySQL database (for example [Aiven for MySQL](https://aiven.io/mysql)).
+The live demo runs on **Vercel** (Singapore, `sin1`) with a free **TiDB Cloud Starter** database
+(MySQL-compatible, also in Singapore so each query is a short hop).
+
+1. Create a free MySQL-compatible database: TiDB Cloud → Create → **Starter** (or any MySQL 8 host such as Aiven).
 2. On Vercel: **Add New → Project**, import this repo, keep the root directory.
-3. Add environment variables: `DATABASE_URL`, `JWT_SECRET`, `DB_SSL=true`, and `DB_CA_CERT` (paste Aiven's CA certificate).
-4. Deploy. The build runs `npm run migrate`, then builds the React app. `/api/*` runs as a serverless function.
-5. Optional: run `npm run seed` locally with the production `DATABASE_URL` to create the demo account.
+3. Add environment variables:
+
+   | Name | Value |
+   |---|---|
+   | `DATABASE_URL` | `mysql://USER:PASSWORD@HOST:4000/payledger` |
+   | `JWT_SECRET` | a long random string (`openssl rand -base64 48`) |
+   | `DB_SSL` | `true` |
+   | `DB_CA_CERT` | only if your provider uses its own certificate authority (Aiven does, TiDB does not) |
+
+4. Deploy. The build runs `npm run migrate` (creates the database and tables), `npm run seed`
+   (demo account, safe to repeat) and builds the React app. `/api/*` runs as a serverless function.
+
+**MySQL vs TiDB.** Tests and benchmarks run on MySQL 8. The same code runs on TiDB: the schema adds
+`AUTO_ID_CACHE=1` inside TiDB-only comments so ids stay in insert order (needed for cursor paging),
+and idempotency replays use `FOR UPDATE` because TiDB does not support `FOR SHARE`.
 
 ## Project layout
 
