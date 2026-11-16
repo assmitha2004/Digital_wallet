@@ -72,6 +72,42 @@ COMMIT
 
 A full explanation of each design choice is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
+### Where to look in the code
+
+| File | Why it matters |
+|---|---|
+| [`server/src/payments.js`](server/src/payments.js) | Lock ordering, balance and daily-limit checks after the lock, double-entry posting, reconcile queries |
+| [`server/src/idempotency.js`](server/src/idempotency.js) | Run-at-most-once wrapper: unique-index insert, replay, request hashing, crash safety |
+| [`server/src/db.js`](server/src/db.js) | Transaction helper and the deadlock retry |
+| [`server/db/schema.sql`](server/db/schema.sql) | Constraints that protect money even if app code is wrong |
+| [`server/tests/api.test.js`](server/tests/api.test.js) | Concurrency and idempotency tests against real MySQL |
+| [`server/scripts/race-demo.js`](server/scripts/race-demo.js) | The experiment that shows why the locks exist |
+
+---
+
+## Design decisions and trade-offs
+
+| Decision | Why | Trade-off |
+|---|---|---|
+| `SELECT … FOR UPDATE` instead of one conditional `UPDATE … WHERE balance >= ?` | A transfer runs several checks (balance, daily limit) and records the balance-after in the ledger, so it needs a stable view of the row for the whole transaction | Holds the lock slightly longer than a single statement |
+| Idempotency key inserted **in the same transaction** as the payment | If the server crashes mid-payment, both roll back together; there is no "stuck in progress" key to clean up | Concurrent duplicates wait on the unique index instead of failing fast |
+| Failed results are saved and replayed too | A retry must never turn into a *new* payment (e.g. after the user adds money) | The client must send a new key to genuinely try again |
+| Frontend keeps the key when there was **no response**, and makes a new one once the server answered | Makes the "Retry" button safe | — |
+| Cursor pagination (`WHERE id < ?`) instead of `OFFSET` | Uses the `(wallet_id, id)` index directly, and new payments don't shift pages | No "jump to page 7" |
+| A single SYSTEM wallet funds all top-ups | Keeps the ledger closed: all balances sum to exactly 0, which reconcile checks | It is a hot row, so top-ups run one at a time; a larger system would shard it |
+
+**Known limits, stated openly:** the login rate limiter is in memory (per instance on serverless; production would
+use Redis), there are no refresh tokens (access tokens last 2 hours), idempotency keys are never expired, top-ups are
+simulated, and there is a single currency (INR).
+
+## Security
+
+- bcrypt password hashing; the same error for "unknown email" and "wrong password", so emails can't be discovered
+- Login rate limit: 10 attempts per 15 minutes per IP
+- Every query is parameterised (no string-built SQL); Zod validates every request body
+- The wallet is always looked up from the token's user id, never from a URL parameter
+- Public transaction ids are UUIDs, so ids can't be guessed; `helmet` sets security headers
+
 ---
 
 ## Features
