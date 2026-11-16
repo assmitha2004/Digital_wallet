@@ -3,6 +3,8 @@ import request from 'supertest';
 import { app } from '../src/app.js';
 import { pool } from '../src/db.js';
 import { migrate } from '../scripts/migrate.js';
+import { config } from '../src/config.js';
+import { currentStep, hotp } from '../src/totp.js';
 
 export const api = () => request(app);
 
@@ -47,3 +49,37 @@ export async function balanceOf(user) {
   const res = await api().get('/api/me').set(user.auth);
   return res.body.wallet.balancePaise;
 }
+
+// ---- Sessions and 2FA ---------------------------------------------------------------------
+
+/** Logs in; returns the response plus the refresh cookie and auth header for convenience. */
+export async function login(email, password = 'password123', otp) {
+  const res = await api().post('/api/auth/login').send({ email, password, ...(otp && { otp }) });
+  return Object.assign(res, {
+    cookie: res.headers['set-cookie'],
+    auth: res.body.accessToken ? { Authorization: `Bearer ${res.body.accessToken}` } : undefined,
+  });
+}
+
+export const refreshWith = (cookie) => api().post('/api/auth/refresh').set('Cookie', cookie).set('X-PayLedger-Client', 'test');
+
+/** Code for the current 30-second step, shifted by `offset` steps (the server accepts -1..+1). */
+export const codeFor = (secret, offset = 0) => hotp(secret, currentStep() + offset);
+
+/** Turns on 2FA for a user and returns the secret. */
+export async function enableTwoFactor(user) {
+  const setup = await api().post('/api/auth/2fa/setup').set(user.auth);
+  const secret = setup.body.secret;
+  const enabled = await api().post('/api/auth/2fa/enable').set(user.auth).send({ code: codeFor(secret) });
+  if (enabled.status !== 200) throw new Error(`2FA enable failed: ${JSON.stringify(enabled.body)}`);
+  return secret;
+}
+
+/** Temporarily changes a config value inside one test. */
+export function withConfig(object, changes) {
+  const previous = Object.fromEntries(Object.keys(changes).map((key) => [key, object[key]]));
+  Object.assign(object, changes);
+  return () => Object.assign(object, previous);
+}
+
+export { config };
