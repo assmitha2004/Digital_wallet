@@ -1,27 +1,48 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import helmet from 'helmet';
 import { ZodError } from 'zod';
+import { adminRouter } from './adminRoutes.js';
 import { authRouter } from './auth.js';
-import { pool } from './db.js';
 import { badRequest } from './errors.js';
+import { httpLogger } from './logger.js';
+import { metricsMiddleware } from './metrics.js';
 import { errorHandler, notFound } from './middleware.js';
+import { opsRouter } from './opsRoutes.js';
+import { apiLimiter } from './rateLimits.js';
 import { walletRouter } from './walletRoutes.js';
 
 export const app = express();
 
-app.set('trust proxy', 1); // correct client IP behind Vercel / nginx (used by the login rate limiter)
-app.use(helmet());
-app.use(express.json({ limit: '10kb' }));
+app.set('trust proxy', 1); // correct client IP behind Vercel / nginx (rate limits, audit log)
+app.disable('x-powered-by');
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        // Razorpay Checkout loads its script and opens its payment frame from these hosts.
+        'script-src': ["'self'", 'https://checkout.razorpay.com'],
+        'frame-src': ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+        'connect-src': ["'self'", 'https://api.razorpay.com', 'https://lumberjack.razorpay.com'],
+        'img-src': ["'self'", 'data:', 'https:'],
+      },
+    },
+  }),
+);
+app.use(httpLogger);
+app.use(metricsMiddleware);
+app.use(cookieParser());
 
 const api = express.Router();
-api.get('/health', async (_req, res) => {
-  await pool.query('SELECT 1');
-  res.json({ status: 'ok' });
-});
+api.use(apiLimiter);
+// Ops routes come before the JSON parser: the payment webhook must read the raw body.
+api.use(opsRouter);
+api.use(express.json({ limit: '10kb' }));
 api.use('/auth', authRouter);
+api.use('/admin', adminRouter);
 api.use(walletRouter);
 api.use(notFound);
 
@@ -35,8 +56,8 @@ if (fs.existsSync(webDist)) {
   app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(webDist, 'index.html')));
 }
 
-// Query-string validation errors from zod `.parse()` become 400s.
-app.use((err, _req, _res, next) => next(err instanceof ZodError ? badRequest('VALIDATION_FAILED', 'Invalid query.') : err));
+// Query-string and URL-parameter validation errors from zod `.parse()` become 400s.
+app.use((err, _req, _res, next) => next(err instanceof ZodError ? badRequest('VALIDATION_FAILED', 'Invalid request parameters.') : err));
 app.use(errorHandler);
 
 export default app;

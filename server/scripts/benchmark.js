@@ -1,10 +1,14 @@
 // Load test over real HTTP. Usage: npm run benchmark   (uses DATABASE_URL; WIPES its tables — use a scratch DB)
 // Env: BENCH_USERS (default 50), BENCH_REQUESTS (2000), BENCH_CONCURRENCY (50)
 import crypto from 'node:crypto';
-import { app } from '../src/app.js';
-import { pool } from '../src/db.js';
-import { reconcileAll } from '../src/payments.js';
-import { migrate } from './migrate.js';
+
+// A load test must measure the payment path, not the rate limiter, so limits are off here.
+process.env.RATE_LIMITS ??= 'off';
+process.env.LOG_LEVEL ??= 'warn';
+const { app } = await import('../src/app.js');
+const { pool } = await import('../src/db.js');
+const { reconcileAll } = await import('../src/payments.js');
+const { migrate } = await import('./migrate.js');
 
 const USERS = Number(process.env.BENCH_USERS ?? 50);
 const REQUESTS = Number(process.env.BENCH_REQUESTS ?? 2000);
@@ -12,7 +16,7 @@ const CONCURRENCY = Number(process.env.BENCH_CONCURRENCY ?? 50);
 
 await migrate();
 await pool.query('SET FOREIGN_KEY_CHECKS = 0');
-for (const table of ['ledger_entries', 'transactions', 'idempotency_keys', 'wallets', 'users']) await pool.query(`TRUNCATE TABLE ${table}`);
+for (const table of ['payment_requests', 'gateway_orders', 'ledger_entries', 'transactions', 'idempotency_keys', 'refresh_tokens', 'audit_logs', 'wallets', 'users']) await pool.query(`TRUNCATE TABLE ${table}`);
 await pool.query('SET FOREIGN_KEY_CHECKS = 1');
 await pool.query("INSERT INTO wallets (id, user_id, kind, balance_paise) VALUES (1, NULL, 'SYSTEM', 0)");
 
@@ -29,7 +33,7 @@ const users = [];
 for (let i = 0; i < USERS; i++) {
   const email = `bench${i}@bench.dev`;
   const res = await post('/auth/register', { name: `Bench ${i}`, email, password: 'password123' });
-  users.push({ email, token: (await res.json()).token });
+  users.push({ email, token: (await res.json()).accessToken });
 }
 await Promise.all(users.map((user) => post('/wallet/topups', { amount: '50000' }, user.token)));
 

@@ -12,7 +12,7 @@ describe('auth', () => {
     const me = await api().get('/api/me').set(asha.auth);
     expect(me.status).toBe(200);
     expect(me.body.user.email).toBe('asha@test.dev');
-    expect(me.body.wallet).toEqual({ balancePaise: 0, balance: '0.00', currency: 'INR' });
+    expect(me.body.wallet).toEqual({ balancePaise: 0, balance: '0.00', currency: 'INR', status: 'ACTIVE' });
   });
 
   it('rejects a duplicate email with 409', async () => {
@@ -26,7 +26,7 @@ describe('auth', () => {
     await createUser('Asha');
     const ok = await api().post('/api/auth/login').send({ email: 'asha@test.dev', password: 'password123' });
     expect(ok.status).toBe(200);
-    expect(ok.body.token).toBeTruthy();
+    expect(ok.body.accessToken).toBeTruthy();
 
     const wrongPassword = await api().post('/api/auth/login').send({ email: 'asha@test.dev', password: 'nope-nope' });
     const unknownEmail = await api().post('/api/auth/login').send({ email: 'ghost@test.dev', password: 'nope-nope' });

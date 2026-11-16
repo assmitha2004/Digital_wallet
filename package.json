@@ -1,9 +1,9 @@
 {
   "name": "payledger",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Digital wallet and payments API with a double-entry ledger, row-level locking and idempotent payments.",
+  "description": "Digital wallet and payments platform: double-entry ledger, row-level locking, idempotent payments, rotating sessions, 2FA, refunds, payment requests, Razorpay, audit log and observability.",
   "engines": {
     "node": ">=20"
   },
@@ -17,7 +17,9 @@
     "benchmark": "node server/scripts/benchmark.js",
     "test": "vitest run",
     "web:dev": "npm --prefix web run dev",
-    "build": "npm --prefix web run build"
+    "build": "npm --prefix web run build",
+    "cleanup": "node server/scripts/cleanup.js",
+    "make-admin": "node server/scripts/make-admin.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

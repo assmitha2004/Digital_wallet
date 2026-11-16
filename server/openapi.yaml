@@ -1,0 +1,470 @@
+openapi: 3.1.0
+info:
+  title: PayLedger API
+  version: 2.0.0
+  description: |
+    Digital wallet API with a double-entry ledger, row-level locking and idempotent payments.
+
+    **Authentication.** `POST /auth/login` returns a short-lived `accessToken` (send it as
+    `Authorization: Bearer <token>`) and sets a rotating refresh token in an httpOnly cookie.
+    `POST /auth/refresh` exchanges the cookie for a new access token.
+
+    **Idempotency.** Every money-moving request needs an `Idempotency-Key` header (8–64 of
+    `A-Z a-z 0-9 _ -`). Retrying with the same key returns the saved response with
+    `Idempotent-Replayed: true` and never moves money twice. Keys are remembered for 24 hours.
+
+    **Amounts** are strings in rupees with at most two decimals (`"250.50"`); responses also
+    give integer paise (`amountPaise`). **Errors** always look like
+    `{"error": {"code": "...", "message": "...", "details"?: [...]}}`.
+servers:
+  - url: /api
+tags:
+  - name: Auth
+  - name: Wallet
+  - name: Payments
+  - name: Requests
+  - name: Admin
+  - name: Ops
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    refreshCookie: { type: apiKey, in: cookie, name: pl_refresh }
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{8,64}$' }
+    ClientHeader:
+      name: X-PayLedger-Client
+      in: header
+      required: true
+      description: Any value. Required on cookie-authenticated endpoints (CSRF defence).
+      schema: { type: string }
+    Uuid:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: integer }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  schemas:
+    Amount: { type: string, example: '250.50', description: 'Rupees, max 2 decimals' }
+    Otp: { type: string, pattern: '^\d{6}$', description: 'Code from an authenticator app' }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: INSUFFICIENT_FUNDS }
+            message: { type: string }
+            details: { type: array, items: { type: object, properties: { field: { type: string }, message: { type: string } } } }
+            requestId: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { type: string, enum: [USER, ADMIN] }
+    Session:
+      type: object
+      properties:
+        accessToken: { type: string }
+        user: { $ref: '#/components/schemas/User' }
+    Transaction:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [TOPUP, TRANSFER, REFUND] }
+        amountPaise: { type: integer }
+        amount: { type: string }
+    PaymentResult:
+      type: object
+      properties:
+        transaction: { $ref: '#/components/schemas/Transaction' }
+        balancePaise: { type: integer }
+        balance: { type: string }
+    ActivityItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [TOPUP, TRANSFER, REFUND] }
+        direction: { type: string, enum: [DEBIT, CREDIT] }
+        amountPaise: { type: integer }
+        balanceAfterPaise: { type: integer }
+        counterparty: { type: [object, 'null'], properties: { name: { type: string }, email: { type: string } } }
+        note: { type: [string, 'null'] }
+        refundOf: { type: [string, 'null'], format: uuid }
+        refundedPaise: { type: integer }
+        refundablePaise: { type: integer, description: 'How much of this received transfer you can still refund' }
+        createdAt: { type: string, format: date-time }
+    PaymentRequest:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        amountPaise: { type: integer }
+        note: { type: [string, 'null'] }
+        status: { type: string, enum: [PENDING, PAID, DECLINED, CANCELLED] }
+        counterparty: { type: object, properties: { name: { type: string }, email: { type: string } } }
+        createdAt: { type: string, format: date-time }
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        action: { type: string, example: LOGIN_SUCCEEDED }
+        actor: { type: [object, 'null'] }
+        target: { type: [object, 'null'] }
+        ip: { type: [string, 'null'] }
+        requestId: { type: [string, 'null'] }
+        metadata: { type: [object, 'null'] }
+        createdAt: { type: string, format: date-time }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+security:
+  - bearer: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account (and its wallet) and start a session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 80 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, maxLength: 72 }
+      responses:
+        '201': { description: Created; sets the refresh cookie, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in. 5 failures lock the account for 15 minutes.
+      description: If two-step verification is on and `otp` is missing, returns 401 `OTP_REQUIRED`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                otp: { $ref: '#/components/schemas/Otp' }
+      responses:
+        '200': { description: Logged in; sets the refresh cookie, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '423': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: New access token from the refresh cookie (the cookie is rotated)
+      description: Reusing an already-rotated refresh token revokes the whole session (theft detection).
+      security: [{ refreshCookie: [] }]
+      parameters: [{ $ref: '#/components/parameters/ClientHeader' }]
+      responses:
+        '200': { description: New session, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: End this session
+      security: [{ refreshCookie: [] }]
+      parameters: [{ $ref: '#/components/parameters/ClientHeader' }]
+      responses: { '204': { description: Logged out } }
+  /auth/logout-all:
+    post:
+      tags: [Auth]
+      summary: End every session on every device (also invalidates access tokens immediately)
+      responses: { '204': { description: Logged out everywhere } }
+  /auth/sessions:
+    get:
+      tags: [Auth]
+      summary: Active sessions (devices)
+      responses: { '200': { description: Sessions } }
+  /auth/2fa/setup:
+    post:
+      tags: [Auth]
+      summary: Create a TOTP secret (not active until enabled)
+      responses:
+        '200':
+          description: Secret and otpauth:// URL for a QR code
+          content: { application/json: { schema: { type: object, properties: { secret: { type: string }, otpauthUrl: { type: string } } } } }
+  /auth/2fa/enable:
+    post:
+      tags: [Auth]
+      summary: Turn on two-step verification with a code from the app
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code], properties: { code: { $ref: '#/components/schemas/Otp' } } } } } }
+      responses: { '200': { description: Enabled }, '401': { $ref: '#/components/responses/Error' } }
+  /auth/2fa/disable:
+    post:
+      tags: [Auth]
+      summary: Turn off two-step verification (needs password and a code)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [password, code], properties: { password: { type: string }, code: { $ref: '#/components/schemas/Otp' } } } } }
+      responses: { '200': { description: Disabled }, '401': { $ref: '#/components/responses/Error' } }
+
+  /me:
+    get:
+      tags: [Wallet]
+      summary: Profile, wallet, limits and enabled features
+      responses: { '200': { description: Profile } }
+  /me/security-events:
+    get:
+      tags: [Wallet]
+      summary: Your recent security events (logins, 2FA changes, ...)
+      responses:
+        '200':
+          description: Events
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } }
+  /wallet/activity:
+    get:
+      tags: [Wallet]
+      summary: History, newest first (cursor pagination)
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200':
+          description: Page of activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ActivityItem' } }
+                  nextCursor: { type: [integer, 'null'] }
+  /wallet/verify:
+    get:
+      tags: [Wallet]
+      summary: Your balance vs. the sum of your ledger entries
+      responses: { '200': { description: Check result } }
+  /wallet/statement:
+    get:
+      tags: [Wallet]
+      summary: Statement for a date range (India time), as CSV, PDF or JSON
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: format, in: query, schema: { type: string, enum: [csv, pdf, json], default: csv } }
+      responses:
+        '200':
+          description: Statement file
+          content:
+            text/csv: { schema: { type: string } }
+            application/pdf: { schema: { type: string, format: binary } }
+            application/json: { schema: { type: object } }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /wallet/topups:
+    post:
+      tags: [Payments]
+      summary: Add money (simulated gateway, max ₹50,000)
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [amount], properties: { amount: { $ref: '#/components/schemas/Amount' } } } } } }
+      responses:
+        '201': { description: Added, content: { application/json: { schema: { $ref: '#/components/schemas/PaymentResult' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+  /wallet/topups/orders:
+    post:
+      tags: [Payments]
+      summary: Start a Razorpay top-up (returns the order for Razorpay Checkout)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [amount], properties: { amount: { $ref: '#/components/schemas/Amount' } } } } } }
+      responses:
+        '201': { description: Order created, content: { application/json: { schema: { type: object, properties: { orderId: { type: string }, keyId: { type: string }, amountPaise: { type: integer }, currency: { type: string } } } } } }
+        '503': { $ref: '#/components/responses/Error' }
+  /wallet/topups/orders/{orderId}/confirm:
+    post:
+      tags: [Payments]
+      summary: Confirm a Razorpay payment with the signature from Checkout
+      parameters: [{ name: orderId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [razorpayPaymentId, razorpaySignature]
+              properties: { razorpayPaymentId: { type: string }, razorpaySignature: { type: string } }
+      responses:
+        '200': { description: 'CREDITED or ALREADY_CREDITED (the webhook got there first)' }
+        '400': { $ref: '#/components/responses/Error' }
+  /transfers:
+    post:
+      tags: [Payments]
+      summary: Send money by email
+      description: Transfers at or above the step-up threshold (₹10,000 by default) need `otp`.
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toEmail, amount]
+              properties:
+                toEmail: { type: string, format: email }
+                amount: { $ref: '#/components/schemas/Amount' }
+                note: { type: string, maxLength: 140 }
+                otp: { $ref: '#/components/schemas/Otp' }
+      responses:
+        '201': { description: Sent, content: { application/json: { schema: { $ref: '#/components/schemas/PaymentResult' } } } }
+        '403': { description: 'WALLET_FROZEN, TWO_FACTOR_REQUIRED or OTP_REQUIRED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { description: 'INSUFFICIENT_FUNDS, LIMIT_EXCEEDED, DAILY_LIMIT_EXCEEDED, IDEMPOTENCY_KEY_REUSED', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /transactions/{id}/refunds:
+    post:
+      tags: [Payments]
+      summary: Refund all or part of a transfer you received
+      parameters: [{ $ref: '#/components/parameters/Uuid' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { $ref: '#/components/schemas/Amount' }
+                reason: { type: string, maxLength: 120 }
+      responses:
+        '201': { description: Refunded, content: { application/json: { schema: { $ref: '#/components/schemas/PaymentResult' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { description: 'ALREADY_REFUNDED, REFUND_TOO_LARGE, NOT_REFUNDABLE, INSUFFICIENT_FUNDS', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /payment-requests:
+    get:
+      tags: [Requests]
+      summary: Requests to you (incoming) or from you (outgoing)
+      parameters:
+        - { name: direction, in: query, schema: { type: string, enum: [incoming, outgoing], default: incoming } }
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, PAID, DECLINED, CANCELLED] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Page of requests
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/PaymentRequest' } }, nextCursor: { type: [integer, 'null'] } } } } }
+    post:
+      tags: [Requests]
+      summary: Ask someone to pay you
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromEmail, amount]
+              properties:
+                fromEmail: { type: string, format: email }
+                amount: { $ref: '#/components/schemas/Amount' }
+                note: { type: string, maxLength: 140 }
+      responses: { '201': { description: Requested }, '422': { $ref: '#/components/responses/Error' } }
+  /payment-requests/{id}/pay:
+    post:
+      tags: [Requests]
+      summary: Pay a request made to you (same limits and 2FA rules as a transfer)
+      parameters: [{ $ref: '#/components/parameters/Uuid' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { otp: { $ref: '#/components/schemas/Otp' } } } } } }
+      responses: { '201': { description: Paid }, '409': { $ref: '#/components/responses/Error' } }
+  /payment-requests/{id}/decline:
+    post:
+      tags: [Requests]
+      summary: Decline a request made to you
+      parameters: [{ $ref: '#/components/parameters/Uuid' }]
+      responses: { '200': { description: Declined }, '409': { $ref: '#/components/responses/Error' } }
+  /payment-requests/{id}/cancel:
+    post:
+      tags: [Requests]
+      summary: Cancel a request you made
+      parameters: [{ $ref: '#/components/parameters/Uuid' }]
+      responses: { '200': { description: Cancelled }, '409': { $ref: '#/components/responses/Error' } }
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: Search users (ADMIN only)
+      parameters: [{ name: q, in: query, schema: { type: string } }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses: { '200': { description: Users }, '403': { $ref: '#/components/responses/Error' } }
+  /admin/users/{id}/freeze:
+    post:
+      tags: [Admin]
+      summary: Freeze a wallet (no money in or out)
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 3 } } } } } }
+      responses: { '200': { description: Frozen } }
+  /admin/users/{id}/unfreeze:
+    post:
+      tags: [Admin]
+      summary: Unfreeze a wallet
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 3 } } } } } }
+      responses: { '200': { description: Unfrozen } }
+  /admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: Audit log, newest first
+      parameters:
+        - { name: action, in: query, schema: { type: string } }
+        - { name: userId, in: query, schema: { type: integer } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Audit entries
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } }
+  /admin/reconcile:
+    get:
+      tags: [Admin]
+      summary: Reconcile the whole ledger (balances, double entries, refunds)
+      responses: { '200': { description: Reconciliation report } }
+
+  /health:
+    get:
+      tags: [Ops]
+      summary: Liveness (process is up; no dependencies checked)
+      security: []
+      responses: { '200': { description: OK } }
+  /ready:
+    get:
+      tags: [Ops]
+      summary: Readiness (database, migrations, Redis)
+      security: []
+      responses: { '200': { description: Ready }, '503': { description: Not ready } }
+  /metrics:
+    get:
+      tags: [Ops]
+      summary: Prometheus metrics (Bearer METRICS_TOKEN in production)
+      responses: { '200': { description: Metrics, content: { text/plain: { schema: { type: string } } } } }
+  /internal/cleanup:
+    post:
+      tags: [Ops]
+      summary: Daily housekeeping (Bearer CRON_SECRET). Expires idempotency keys and old refresh tokens.
+      responses: { '200': { description: Rows removed } }
+  /webhooks/razorpay:
+    post:
+      tags: [Ops]
+      summary: Razorpay webhook (HMAC-SHA256 signature in X-Razorpay-Signature)
+      security: []
+      responses: { '200': { description: Acknowledged }, '400': { $ref: '#/components/responses/Error' } }

@@ -15,7 +15,7 @@ export async function resetDatabase() {
     migrated = true;
   }
   await pool.query('SET FOREIGN_KEY_CHECKS = 0');
-  for (const table of ['ledger_entries', 'transactions', 'idempotency_keys', 'wallets', 'users']) {
+  for (const table of ['payment_requests', 'gateway_orders', 'ledger_entries', 'transactions', 'idempotency_keys', 'refresh_tokens', 'audit_logs', 'wallets', 'users']) {
     await pool.query(`TRUNCATE TABLE ${table}`);
   }
   await pool.query('SET FOREIGN_KEY_CHECKS = 1');
@@ -28,7 +28,7 @@ export async function createUser(name) {
   const email = `${name.toLowerCase()}@test.dev`;
   const res = await api().post('/api/auth/register').send({ name, email, password: 'password123' });
   if (res.status !== 201) throw new Error(`register failed: ${res.status} ${JSON.stringify(res.body)}`);
-  return { token: res.body.token, email, auth: { Authorization: `Bearer ${res.body.token}` } };
+  return { id: res.body.user.id, token: res.body.accessToken, email, auth: { Authorization: `Bearer ${res.body.accessToken}` }, cookie: res.headers['set-cookie'] };
 }
 
 export function addMoney(user, amount, key = newKey()) {

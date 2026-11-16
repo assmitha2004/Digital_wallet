@@ -12,6 +12,9 @@ export default defineConfig({
       JWT_SECRET: 'test-secret',
       BCRYPT_ROUNDS: '4',
       DB_POOL_SIZE: '20',
+      // Above the per-transfer limit, so older tests are about limits, not 2FA. 2FA tests lower it.
+      STEP_UP_THRESHOLD_RUPEES: '1000000',
+      LOG_LEVEL: 'silent',
     },
   },
 });
