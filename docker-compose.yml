@@ -11,14 +11,35 @@ services:
       retries: 30
     volumes: [mysql-data:/var/lib/mysql]
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
   app:
     build: .
     environment:
       DATABASE_URL: mysql://root:root@mysql:3306/payledger
       JWT_SECRET: ${JWT_SECRET:-local-docker-secret-change-me}
+      REDIS_URL: redis://redis:6379
+      COOKIE_SECURE: "false" # plain http on localhost; keep secure cookies behind HTTPS
+      METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-token}
+      CRON_SECRET: ${CRON_SECRET:-local-cron-secret}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
     ports: ["4000:4000"]
     depends_on:
       mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/ready"]
+      interval: 10s
+      retries: 5
+    stop_grace_period: 15s # time for in-flight payments to finish on SIGTERM
 
 volumes:
   mysql-data:
