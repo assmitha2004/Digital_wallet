@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ApiError, apiRequest, getToken, NetworkError, setToken } from './api.js';
-
-const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' });
-const formatPaise = (paise) => rupee.format(paise / 100);
-const newKey = () => crypto.randomUUID();
+import { ApiError, apiRequest, logout, onSessionEnded, refreshSession, setAccessToken } from './api.js';
+import { errorText, formatPaise } from './lib.js';
+import { Activity } from './tabs/Activity.jsx';
+import { Admin } from './tabs/Admin.jsx';
+import { Home } from './tabs/Home.jsx';
+import { Requests } from './tabs/Requests.jsx';
+import { Security } from './tabs/Security.jsx';
+import { Statements } from './tabs/Statements.jsx';
 
 export default function App() {
-  const [session, setSession] = useState(() => (getToken() ? 'loading' : 'signed-out'));
+  const [session, setSession] = useState('loading'); // loading | signed-out | signed-in | error
   const [me, setMe] = useState(null);
 
   const loadMe = useCallback(async () => {
@@ -15,40 +18,45 @@ export default function App() {
       setMe(data);
       setSession('signed-in');
     } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        setToken(null);
-        setSession('signed-out');
-      } else {
-        setSession('error');
-      }
+      if (err instanceof ApiError && err.status === 401) setSession('signed-out');
+      else setSession('error');
     }
   }, []);
 
+  // On first load there is no access token in memory: try the refresh cookie.
   useEffect(() => {
-    if (session === 'loading') loadMe();
-  }, [session, loadMe]);
+    onSessionEnded(() => {
+      setAccessToken(null);
+      setMe(null);
+      setSession('signed-out');
+    });
+    refreshSession().then((s) => (s ? loadMe() : setSession('signed-out')));
+  }, [loadMe]);
 
-  const signOut = () => {
-    setToken(null);
+  const signOut = async () => {
+    await logout();
     setMe(null);
     setSession('signed-out');
   };
 
-  if (session === 'signed-out') return <AuthScreen onSignedIn={() => setSession('loading')} />;
+  if (session === 'loading') return <div className="center-note">Loading…</div>;
+  if (session === 'signed-out') return <AuthScreen onSignedIn={loadMe} />;
   if (session === 'error')
     return (
       <div className="center-note">
         <p>Could not reach PayLedger.</p>
-        <button className="btn" onClick={() => setSession('loading')}>Try again</button>
+        <button className="btn" onClick={() => loadMe()}>
+          Try again
+        </button>
       </div>
     );
-  if (!me) return <div className="center-note">Loading…</div>;
-  return <Dashboard me={me} onRefresh={loadMe} onSignOut={signOut} />;
+  return <Dashboard me={me} onRefresh={loadMe} onSignOut={signOut} onSignedOutEverywhere={() => setSession('signed-out')} />;
 }
 
 function AuthScreen({ onSignedIn }) {
   const [mode, setMode] = useState('login');
-  const [form, setForm] = useState({ name: '', email: '', password: '' });
+  const [form, setForm] = useState({ name: '', email: '', password: '', otp: '' });
+  const [needOtp, setNeedOtp] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -57,18 +65,32 @@ function AuthScreen({ onSignedIn }) {
     setBusy(true);
     setError('');
     try {
-      const body = mode === 'login' ? { email: form.email, password: form.password } : form;
+      const body =
+        mode === 'login'
+          ? { email: form.email, password: form.password, ...(needOtp && form.otp && { otp: form.otp }) }
+          : { name: form.name, email: form.email, password: form.password };
       const { data } = await apiRequest(`/auth/${mode === 'login' ? 'login' : 'register'}`, { method: 'POST', body });
-      setToken(data.token);
+      setAccessToken(data.accessToken);
       onSignedIn();
     } catch (err) {
-      setError(err.details?.map((d) => `${d.field}: ${d.message}`).join(' · ') || err.message);
+      if (err.code === 'OTP_REQUIRED') {
+        setNeedOtp(true);
+        setError('');
+      } else {
+        if (['INVALID_OTP', 'OTP_ALREADY_USED'].includes(err.code)) setForm((f) => ({ ...f, otp: '' }));
+        setError(errorText(err));
+      }
     } finally {
       setBusy(false);
     }
   };
 
   const field = (name) => ({ value: form[name], onChange: (e) => setForm({ ...form, [name]: e.target.value }) });
+  const switchMode = (tab) => {
+    setMode(tab);
+    setNeedOtp(false);
+    setError('');
+  };
 
   return (
     <main className="auth">
@@ -82,19 +104,23 @@ function AuthScreen({ onSignedIn }) {
           accounted for.
         </h1>
         <p>
-          A digital wallet built on a double-entry ledger. Payments are locked, idempotent and audited, so money is never
-          lost, duplicated or double-spent.
+          A digital wallet built on a double-entry ledger. Payments are locked, idempotent and audited, so money is never lost,
+          duplicated or double-spent.
         </p>
         <ul className="auth-points">
           <li>Each payment writes a matching debit and credit</li>
           <li>Retrying a payment never charges twice</li>
-          <li>Simultaneous payments cannot overdraw a wallet</li>
+          <li>Two-step verification for logins and large payments</li>
+          <li>Refunds, payment requests and downloadable statements</li>
         </ul>
+        <p className="muted">
+          Demo login: <code>demo@payledger.dev</code> / <code>demo12345</code>
+        </p>
       </section>
       <form className="card auth-card" onSubmit={submit}>
         <div className="tabs" role="tablist">
           {['login', 'register'].map((tab) => (
-            <button key={tab} type="button" role="tab" aria-selected={mode === tab} className={mode === tab ? 'tab active' : 'tab'} onClick={() => setMode(tab)}>
+            <button key={tab} type="button" role="tab" aria-selected={mode === tab} className={mode === tab ? 'tab active' : 'tab'} onClick={() => switchMode(tab)}>
               {tab === 'login' ? 'Log in' : 'Create account'}
             </button>
           ))}
@@ -111,23 +137,45 @@ function AuthScreen({ onSignedIn }) {
         </label>
         <label>
           Password
-          <input required type="password" minLength={mode === 'register' ? 8 : 1} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} {...field('password')} />
+          <input
+            required
+            type="password"
+            minLength={mode === 'register' ? 8 : 1}
+            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            {...field('password')}
+          />
         </label>
+        {needOtp && (
+          <label>
+            Code from your authenticator app
+            <input required autoFocus inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="\d{6}" {...field('otp')} />
+          </label>
+        )}
         {error && <p className="form-error">{error}</p>}
         <button className="btn primary wide" disabled={busy}>
-          {busy ? 'Please wait…' : mode === 'login' ? 'Log in' : 'Create account'}
+          {busy ? 'Please wait…' : mode === 'login' ? (needOtp ? 'Verify and log in' : 'Log in') : 'Create account'}
         </button>
       </form>
     </main>
   );
 }
 
-function Dashboard({ me, onRefresh, onSignOut }) {
-  const [activityVersion, setActivityVersion] = useState(0);
-  const afterPayment = () => {
+const TABS = [
+  ['home', 'Home'],
+  ['activity', 'Activity'],
+  ['requests', 'Requests'],
+  ['statements', 'Statements'],
+  ['security', 'Security'],
+];
+
+function Dashboard({ me, onRefresh, onSignOut, onSignedOutEverywhere }) {
+  const [tab, setTab] = useState('home');
+  const [version, setVersion] = useState(0);
+  const changed = () => {
     onRefresh();
-    setActivityVersion((v) => v + 1);
+    setVersion((v) => v + 1);
   };
+  const tabs = me.user.role === 'ADMIN' ? [...TABS, ['admin', 'Admin']] : TABS;
 
   return (
     <div className="shell">
@@ -137,7 +185,9 @@ function Dashboard({ me, onRefresh, onSignOut }) {
         </div>
         <div className="topbar-user">
           <span>{me.user.email}</span>
-          <button className="btn ghost small" onClick={onSignOut}>Log out</button>
+          <button className="btn ghost small" onClick={onSignOut}>
+            Log out
+          </button>
         </div>
       </header>
 
@@ -145,103 +195,34 @@ function Dashboard({ me, onRefresh, onSignOut }) {
         <div>
           <p className="eyebrow">Available balance</p>
           <p className="balance-amount">{formatPaise(me.wallet.balancePaise)}</p>
-          <p className="muted-light">Hi {me.user.name.split(' ')[0]} — your balance is checked against the ledger on every load.</p>
+          <p className="muted-light">
+            Hi {me.user.name.split(' ')[0]} — your balance is checked against the ledger on every load.
+            {me.wallet.status === 'FROZEN' && <strong className="frozen"> Your wallet is frozen. Contact support.</strong>}
+          </p>
         </div>
-        <LedgerCheck version={activityVersion} />
+        <LedgerCheck version={version} />
       </section>
 
-      <div className="grid">
-        <PaymentForm
-          title="Add money"
-          subtitle="Simulated payment gateway · max ₹50,000"
-          submitLabel="Add money"
-          fields={[{ name: 'amount', label: 'Amount (₹)', inputMode: 'decimal', placeholder: '500.00' }]}
-          path="/wallet/topups"
-          success={(data) => `Added ${formatPaise(data.transaction.amountPaise)}.`}
-          onDone={afterPayment}
-        />
-        <PaymentForm
-          title="Send money"
-          subtitle="To any PayLedger user by email · max ₹1,00,000"
-          submitLabel="Send"
-          fields={[
-            { name: 'toEmail', label: 'Recipient email', type: 'email', placeholder: 'friend@example.com' },
-            { name: 'amount', label: 'Amount (₹)', inputMode: 'decimal', placeholder: '250.00' },
-            { name: 'note', label: 'Note (optional)', optional: true, placeholder: 'Dinner' },
-          ]}
-          path="/transfers"
-          success={(data) => `Sent ${formatPaise(data.transaction.amountPaise)} to ${data.transaction.to.name}.`}
-          onDone={afterPayment}
-        />
-      </div>
+      <nav className="nav" role="tablist">
+        {tabs.map(([id, label]) => (
+          <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'nav-item active' : 'nav-item'} onClick={() => setTab(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
 
-      <Activity version={activityVersion} />
+      {tab === 'home' && (
+        <>
+          <Home me={me} onPaid={changed} goTo={setTab} />
+          <Activity version={version} onChanged={changed} compact />
+        </>
+      )}
+      {tab === 'activity' && <Activity version={version} onChanged={changed} />}
+      {tab === 'requests' && <Requests me={me} version={version} onChanged={changed} />}
+      {tab === 'statements' && <Statements />}
+      {tab === 'security' && <Security me={me} onChanged={changed} onSignedOutEverywhere={onSignedOutEverywhere} />}
+      {tab === 'admin' && me.user.role === 'ADMIN' && <Admin me={me} />}
     </div>
-  );
-}
-
-/**
- * One idempotency key per payment attempt.
- *  - Server answered (success OR a business error like insufficient funds): make a new key.
- *  - No answer (network error / 5xx): KEEP the key, so pressing "Retry" can never pay twice.
- */
-function PaymentForm({ title, subtitle, submitLabel, fields, path, success, onDone }) {
-  const empty = Object.fromEntries(fields.map((f) => [f.name, '']));
-  const [values, setValues] = useState(empty);
-  const [idempotencyKey, setIdempotencyKey] = useState(newKey);
-  const [status, setStatus] = useState({ kind: 'idle' });
-
-  const submit = async (event) => {
-    event.preventDefault();
-    setStatus({ kind: 'busy' });
-    const body = Object.fromEntries(Object.entries(values).filter(([, v]) => v !== ''));
-    try {
-      const { data, replayed } = await apiRequest(path, { method: 'POST', body, idempotencyKey });
-      setStatus({ kind: 'ok', message: success(data) + (replayed ? ' (already processed — not charged again)' : '') });
-      setValues(empty);
-      setIdempotencyKey(newKey());
-      onDone();
-    } catch (err) {
-      const keepKey = err instanceof NetworkError || (err instanceof ApiError && err.status >= 500);
-      if (!keepKey) setIdempotencyKey(newKey());
-      setStatus({ kind: 'error', retry: keepKey, message: err.details?.map((d) => d.message).join(' ') || err.message });
-    }
-  };
-
-  const edit = (name) => (e) => {
-    setValues({ ...values, [name]: e.target.value });
-    // Changing the payment after a failed attempt makes it a NEW payment, so it needs a new key.
-    if (status.kind === 'error' && status.retry) setIdempotencyKey(newKey());
-    if (status.kind !== 'busy') setStatus({ kind: 'idle' });
-  };
-
-  return (
-    <form className="card" onSubmit={submit}>
-      <h2>{title}</h2>
-      <p className="muted">{subtitle}</p>
-      {fields.map((f) => (
-        <label key={f.name}>
-          {f.label}
-          <input
-            required={!f.optional}
-            type={f.type ?? 'text'}
-            inputMode={f.inputMode}
-            placeholder={f.placeholder}
-            maxLength={f.name === 'note' ? 140 : undefined}
-            value={values[f.name]}
-            onChange={edit(f.name)}
-          />
-        </label>
-      ))}
-      {status.kind === 'ok' && <p className="form-ok">{status.message}</p>}
-      {status.kind === 'error' && <p className="form-error">{status.message}</p>}
-      <button className="btn primary wide" disabled={status.kind === 'busy'}>
-        {status.kind === 'busy' ? 'Processing…' : status.kind === 'error' && status.retry ? 'Retry safely' : submitLabel}
-      </button>
-      <p className="key-hint" title="Sent as the Idempotency-Key header">
-        Idempotency key <code>{idempotencyKey.slice(0, 8)}…</code>
-      </p>
-    </form>
   );
 }
 
@@ -263,63 +244,5 @@ function LedgerCheck({ version }) {
         </span>
       </div>
     </div>
-  );
-}
-
-function Activity({ version }) {
-  const [items, setItems] = useState([]);
-  const [cursor, setCursor] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  const load = useCallback(async (fromCursor) => {
-    setLoading(true);
-    try {
-      const { data } = await apiRequest(`/wallet/activity?limit=10${fromCursor ? `&cursor=${fromCursor}` : ''}`);
-      setItems((prev) => (fromCursor ? [...prev, ...data.items] : data.items));
-      setCursor(data.nextCursor);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load(null);
-  }, [version, load]);
-
-  return (
-    <section className="card">
-      <h2>Activity</h2>
-      {items.length === 0 && !loading && <p className="muted">No payments yet. Add money to get started.</p>}
-      <ul className="activity">
-        {items.map((item) => {
-          const incoming = item.direction === 'CREDIT';
-          const who = item.type === 'TOPUP' ? 'Added money' : incoming ? `From ${item.counterparty?.name}` : `To ${item.counterparty?.name}`;
-          return (
-            <li key={`${item.id}-${item.direction}`}>
-              <span className={incoming ? 'icon in' : 'icon out'}>{incoming ? '↓' : '↑'}</span>
-              <div className="activity-main">
-                <strong>{who}</strong>
-                <span className="muted">
-                  {new Date(item.createdAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}
-                  {item.note && item.type === 'TRANSFER' ? ` · ${item.note}` : ''}
-                </span>
-              </div>
-              <div className="activity-amount">
-                <strong className={incoming ? 'in' : 'out'}>
-                  {incoming ? '+' : '−'}
-                  {formatPaise(item.amountPaise)}
-                </strong>
-                <span className="muted">bal {formatPaise(item.balanceAfterPaise)}</span>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-      {cursor && (
-        <button className="btn ghost wide" disabled={loading} onClick={() => load(cursor)}>
-          {loading ? 'Loading…' : 'Load older'}
-        </button>
-      )}
-    </section>
   );
 }
