@@ -1,9 +1,10 @@
-# PayLedger — Digital Wallet & Payments
+# PayLedger
 
-A full-stack digital wallet: users add money, send it to each other by email, and see their history.
-The interesting part is under the hood — a **double-entry ledger**, **row-level locking** and
-**idempotent payments**, so money is never double-spent, duplicated or lost, even when many requests
-arrive at the same moment or a client retries after a timeout.
+**A full-stack digital wallet where money stays correct under concurrent requests and client retries.**
+
+Users add money, send it to each other by email and see their history. Underneath, every payment is a
+double-entry ledger write, wallet rows are locked in a fixed order, and every payment request is idempotent.
+So money is never double-spent, duplicated or lost.
 
 ![Node.js](https://img.shields.io/badge/Node.js-339933?logo=node.js&logoColor=white)
 ![Express](https://img.shields.io/badge/Express-000000?logo=express&logoColor=white)
@@ -11,105 +12,117 @@ arrive at the same moment or a client retries after a timeout.
 ![React](https://img.shields.io/badge/React-20232A?logo=react&logoColor=61DAFB)
 ![Vitest](https://img.shields.io/badge/Vitest-6E9F18?logo=vitest&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&logoColor=white)
 
-**Live demo:** https://digital-wallet-coral-theta.vercel.app · demo login `demo@payledger.dev` / `demo12345`
+**Live demo:** [digital-wallet-coral-theta.vercel.app](https://digital-wallet-coral-theta.vercel.app) — log in with `demo@payledger.dev` / `demo12345`
 
 <img src="docs/screenshots/dashboard.png" alt="PayLedger dashboard" width="860">
 
-**43 automated tests** · **0 double-spends in 50 simultaneous requests** · **0 deadlocks with ordered locking** · **~300 transfers/s with the ledger still balanced**
+| 43 automated tests | 0 double-spends | 0 deadlocks | ~300 transfers/s |
+|:---:|:---:|:---:|:---:|
+| run against real MySQL in CI | 50 simultaneous transfers | with ordered locking | ledger still balanced |
 
 ---
 
-## What it does
+## The problem, in one experiment
 
-| Feature | Details |
-|---|---|
-| Accounts | Register / log in, bcrypt password hashing, JWT auth, login rate limiting |
-| Wallet | One wallet per user, balance in ₹ stored as integer **paise** |
-| Add money | Simulated payment gateway, up to ₹50,000 per top-up |
-| Send money | To any user by email, with an optional note; ₹1,00,000 per transfer, ₹2,00,000 per day |
-| History | Newest-first activity with running balance, **cursor pagination** |
-| Audit | `GET /api/wallet/verify` and `npm run reconcile` prove every balance equals its ledger |
+A wallet holds ₹100. Fifty requests to send ₹10 arrive at the same moment. Exactly 10 should succeed.
+
+`npm run race-demo` runs this against MySQL 8 (it also runs in CI):
+
+| Method | Transfers accepted (correct: 10) | Money created from nothing |
+|---|:---:|:---:|
+| Read balance, check, write (no lock) | **50** | **₹440** |
+| `SELECT … FOR UPDATE` (this project) | **10** | **₹0** |
+
+| Method (100 transfers, half A→B, half B→A) | Deadlocks |
+|---|:---:|
+| Lock the sender's wallet first | 50 |
+| Lock the lower wallet id first (this project) | **0** |
+
+---
 
 ## How money stays correct
 
-| Problem | What could go wrong | How PayLedger prevents it |
+| Risk | What could go wrong | How PayLedger prevents it |
 |---|---|---|
-| **Double-spending** | Two ₹60 transfers from a ₹100 wallet both see "₹100" and both go through | `SELECT … FOR UPDATE` locks the wallet row; the balance check runs *after* the lock |
-| **Deadlocks** | A→B and B→A at the same time each hold one lock and wait for the other forever | Wallets are always locked in **ascending id order**, plus a small retry for any deadlock InnoDB still reports |
-| **Duplicate payments** | The network drops the response, the app retries, the user pays twice | `Idempotency-Key` header + a **UNIQUE index**: the same key runs once, retries get the saved response |
-| **Lost money** | A bug updates one balance but not the other | **Double-entry ledger**: every payment writes one DEBIT and one CREDIT in the same DB transaction |
-| **Rounding errors** | `0.1 + 0.2 = 0.30000000000000004` | Money is integer **paise** (`BIGINT`), parsed from strings — never floats |
-| **App bugs** | Some future code path overdraws a wallet | MySQL `CHECK (balance_paise >= 0)` rejects it at the database |
+| **Double-spending** | Two ₹60 transfers from a ₹100 wallet both see ₹100 and both succeed | `SELECT … FOR UPDATE` locks the wallet row; the balance check runs only after the lock is held |
+| **Deadlocks** | A→B and B→A each hold one lock and wait for the other | Wallets are always locked in ascending id order; a rare InnoDB deadlock is retried (safe, because the aborted transaction wrote nothing) |
+| **Duplicate payments** | The response is lost, the app retries, the user pays twice | `Idempotency-Key` header + `UNIQUE(user_id, idem_key)`: the same key runs once, and retries get the saved response |
+| **Key reuse** | The same key is sent with a different amount | The request body is hashed (SHA-256); a mismatch returns `422 IDEMPOTENCY_KEY_REUSED` |
+| **Lost money** | A bug updates one balance but not the other | Double-entry ledger: one DEBIT and one CREDIT in the same transaction; `npm run reconcile` audits the whole ledger |
+| **Rounding errors** | `0.1 + 0.2 = 0.30000000000000004` | Money is integer paise (`BIGINT`), parsed from strings, never floats |
+| **Future bugs** | New code overdraws a wallet | MySQL `CHECK (balance_paise >= 0)` rejects it at the database |
 
-### Proof: `npm run race-demo`
-
-Real output against MySQL 8 (it runs in CI too):
-
-```
-Experiment 1: 50 simultaneous ₹10 transfers from a ₹100 wallet
-│ method                       │ transfers accepted (correct: 10) │ sender left (₹) │ receiver got (₹) │ money created out of nothing (₹) │
-│ read, check, write (no lock) │ 50                               │ 40              │ 500              │ 440                              │
-│ SELECT ... FOR UPDATE        │ 10                               │ 0               │ 100              │ 0                                │
-
-Experiment 2: 100 simultaneous transfers, half A->B and half B->A
-│ method              │ deadlocks out of 100 transfers │
-│ lock sender first   │ 50                             │
-│ lock lower id first │ 0                              │
-```
-
-### Load test: `npm run benchmark`
-
-2,000 random transfers between 50 users, 50 concurrent clients, single Node process + MySQL on a
-2-core dev container (your numbers will differ):
-
-| Throughput | p50 | p95 | p99 | Errors | Ledger consistent after |
-|---|---|---|---|---|---|
-| ~300 transfers/s | ~150 ms | ~240 ms | ~285 ms | 0 | yes |
-
-## Architecture
-
-```
-React (Vite)  ──fetch /api──►  Express API  ──mysql2 pool──►  MySQL 8 (InnoDB)
-                                 │
-                                 ├─ auth.js         register / login, JWT
-                                 ├─ walletRoutes.js validation (zod), routes
-                                 ├─ idempotency.js  run-at-most-once wrapper
-                                 └─ payments.js     locking + double-entry posting + audit
-```
-
-A transfer, step by step (one database transaction):
+### One transfer, step by step (a single DB transaction)
 
 ```
 BEGIN
-  INSERT idempotency key            -- duplicate? replay saved response and stop
-  look up recipient by email
-  SELECT wallet (lower id) FOR UPDATE
+  INSERT idempotency key                 -- already used? replay the saved response and stop
+  find recipient by email
+  SELECT wallet (lower id)  FOR UPDATE
   SELECT wallet (higher id) FOR UPDATE
-  check balance, per-transfer limit, daily limit   -- all checks happen while holding the locks
+  check balance, per-transfer limit, daily limit     -- all while holding the locks
   UPDATE sender   balance - amount
   UPDATE receiver balance + amount
-  INSERT transaction  + 2 ledger entries (DEBIT, CREDIT)
-  save response on the idempotency key
+  INSERT transaction + 2 ledger entries (DEBIT, CREDIT)
+  save the response on the idempotency key
 COMMIT
 ```
 
-More detail, in plain English: [`docs/DESIGN.md`](docs/DESIGN.md).
+A full explanation of each design choice is in [`docs/DESIGN.md`](docs/DESIGN.md).
+
+---
+
+## Features
+
+- Register and log in (bcrypt password hashing, JWT, login rate limiting)
+- Add money through a simulated payment gateway (up to ₹50,000 per top-up)
+- Send money by email with an optional note (₹1,00,000 per transfer, ₹2,00,000 per day, day measured in IST)
+- Activity history, newest first, with running balance and cursor pagination
+- `GET /api/wallet/verify` shows that your balance equals the sum of your ledger entries
+
+## Architecture
+
+```mermaid
+flowchart LR
+  UI["React (Vite)"] -->|"REST /api + JWT"| API
+  subgraph API["Express API"]
+    AUTH["auth.js<br/>register, login"]
+    ROUTES["walletRoutes.js<br/>Zod validation"]
+    IDEM["idempotency.js<br/>run at most once"]
+    PAY["payments.js<br/>locks + double entry"]
+    ROUTES --> IDEM --> PAY
+  end
+  API -->|"mysql2 pool"| DB[("MySQL 8 / InnoDB")]
+```
+
+```
+users ──1:1── wallets ──1:N── ledger_entries ──N:1── transactions
+  └──1:N── idempotency_keys
+```
+
+- `wallets.balance_paise` is a cached total; `ledger_entries` is the source of truth.
+- Clients see UUIDs (`transactions.public_id`); internal auto-increment ids are never exposed.
+- Indexes: `ledger_entries(wallet_id, id)` for history paging, `transactions(from_wallet_id, type, created_at)`
+  for the daily limit, `UNIQUE(user_id, idem_key)` for idempotency.
+
+Full schema: [`server/db/schema.sql`](server/db/schema.sql)
 
 ## API
 
-All endpoints except `/api/auth/*` need `Authorization: Bearer <token>`.
-Payments need an `Idempotency-Key` header (8–64 characters). Errors look like `{"error": {"code", "message"}}`.
+All endpoints except `/api/auth/*` need `Authorization: Bearer <token>`. Payments also need an
+`Idempotency-Key` header (8–64 characters). Errors have one shape: `{"error": {"code", "message"}}`.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | POST | `/api/auth/register` | `{name, email, password}` → token |
 | POST | `/api/auth/login` | `{email, password}` → token (rate limited) |
 | GET | `/api/me` | Profile and balance |
-| POST | `/api/wallet/topups` | `{amount: "500.00"}` — add money |
-| POST | `/api/transfers` | `{toEmail, amount: "250.50", note?}` — send money |
+| POST | `/api/wallet/topups` | `{amount: "500.00"}` |
+| POST | `/api/transfers` | `{toEmail, amount: "250.50", note?}` |
 | GET | `/api/wallet/activity?limit=20&cursor=…` | History, newest first |
-| GET | `/api/wallet/verify` | Balance vs ledger sum for your wallet |
+| GET | `/api/wallet/verify` | Balance vs ledger sum |
 | GET | `/api/health` | Health check |
 
 ```bash
@@ -120,103 +133,98 @@ curl -X POST localhost:4000/api/transfers \
   -d '{"toEmail":"meera@payledger.dev","amount":"120.50","note":"Dinner split"}'
 ```
 
-Send the same request again and you get the same response with `Idempotent-Replayed: true`, and no second payment.
+Sending the same request again returns the same response with `Idempotent-Replayed: true`, and no second payment.
 
 | Code | Status | Meaning |
-|---|---|---|
+|---|:---:|---|
 | `INSUFFICIENT_FUNDS` | 422 | Balance too low |
-| `LIMIT_EXCEEDED` / `DAILY_LIMIT_EXCEEDED` | 422 | Over a payment limit |
-| `IDEMPOTENCY_KEY_REUSED` | 422 | Same key, different request body |
+| `LIMIT_EXCEEDED`, `DAILY_LIMIT_EXCEEDED` | 422 | Over a payment limit |
+| `IDEMPOTENCY_KEY_REUSED` | 422 | Same key, different request |
 | `RECIPIENT_NOT_FOUND` | 404 | No user with that email |
-| `VALIDATION_FAILED` | 400 | Bad input (e.g. `"1.999"`) |
+| `VALIDATION_FAILED` | 400 | Bad input, e.g. `"1.999"` |
 
-## Data model
+## Testing
 
+Tests run against a **real MySQL database**, because locking behaviour cannot be tested with mocks.
+
+```bash
+npm test             # 43 tests: money parsing, auth, payments, idempotency, concurrency, history
+npm run race-demo    # the experiment above
+npm run benchmark    # load test (wipes its database: use a scratch DB)
+npm run reconcile    # audits the whole ledger; exits 1 on any mismatch
 ```
-users ──1:1── wallets ──1:N── ledger_entries ──N:1── transactions
-  └──1:N── idempotency_keys
-```
 
-- `wallets.balance_paise` is a cached total; `ledger_entries` is the source of truth.
-- `transactions.public_id` is a UUID — internal auto-increment ids are never exposed.
-- Indexes: `ledger_entries(wallet_id, id)` for history paging, `transactions(from_wallet_id, type, created_at)` for the daily limit, `UNIQUE(user_id, idem_key)` for idempotency.
+What the tests prove:
 
-Full schema: [`server/db/schema.sql`](server/db/schema.sql).
+- 50 simultaneous ₹10 transfers from a ₹100 wallet → exactly 10 succeed, and the balance never goes negative.
+- Opposite-direction transfers at the same time all finish without deadlock, and total money is unchanged.
+- 20 simultaneous requests with the same idempotency key → exactly one transfer.
+- A failed payment is replayed too, so a later retry cannot succeed by surprise.
+- The `CHECK` constraint rejects a negative balance even if application code were wrong.
+
+**CI** (GitHub Actions, on every push and pull request): tests against a MySQL 8.4 service container,
+the race demo and the frontend build.
+
+### Load test
+
+2,000 random transfers between 50 users, 50 concurrent clients, one Node process + MySQL on a
+2-core dev container. Your numbers will differ.
+
+| Throughput | p50 | p95 | p99 | Errors | Ledger balanced after |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| ~300 transfers/s | ~150 ms | ~240 ms | ~285 ms | 0 | yes |
 
 ## Run it locally
 
 Needs Node 20+ and MySQL 8.
 
 ```bash
-cp .env.example .env            # set DATABASE_URL and JWT_SECRET
+cp .env.example .env              # set DATABASE_URL and JWT_SECRET
 npm install && npm --prefix web install
-npm run migrate                 # create tables
-npm run seed                    # optional demo data
-npm run dev                     # API on http://localhost:4000
-npm run web:dev                 # React app on http://localhost:5173
+npm run migrate                   # create tables
+npm run seed                      # optional demo data
+npm run dev                       # API on http://localhost:4000
+npm run web:dev                   # React app on http://localhost:5173
 ```
 
-Or everything with Docker: `docker compose up --build`, then open http://localhost:4000.
+Or run everything with Docker: `docker compose up --build`, then open http://localhost:4000.
 
-## Tests
+## Deployment
 
-```bash
-npm test             # 43 tests: money parsing, auth, payments, idempotency, concurrency, history
-npm run race-demo    # why the locks exist, with numbers
-npm run benchmark    # load test (wipes its database — point DATABASE_URL at a scratch DB)
-npm run reconcile    # audits the whole ledger, exits 1 on any mismatch
-```
+The live demo runs on **Vercel** (Singapore) with a **TiDB Cloud** database (MySQL-compatible). `/api/*` runs as
+a serverless function. The build runs the migration and the seed (safe to repeat), then builds the React app.
 
-Tests run against a **real MySQL**, because locking behaviour cannot be tested with mocks.
-Highlights:
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | `mysql://USER:PASSWORD@HOST:4000/payledger` |
+| `JWT_SECRET` | a long random string (`openssl rand -base64 48`) |
+| `DB_SSL` | `true` |
+| `DB_CA_CERT` | only if your provider uses its own certificate authority |
 
-- 50 simultaneous ₹10 transfers from a ₹100 wallet → exactly 10 succeed, final balance ₹0.
-- 60 opposite-direction transfers at once → all succeed, total money unchanged.
-- 20 simultaneous requests with the same idempotency key → exactly one transfer.
-- A failed payment (insufficient funds) is also replayed, so a later retry cannot succeed by surprise.
-- Removing `FOR UPDATE` makes the concurrency tests fail (checked by hand).
-
-CI (GitHub Actions) runs the tests, the race demo and the frontend build against MySQL on every push.
-
-## Deploy to Vercel
-
-The live demo runs on **Vercel** (Singapore, `sin1`) with a free **TiDB Cloud Starter** database
-(MySQL-compatible, also in Singapore so each query is a short hop).
-
-1. Create a free MySQL-compatible database: TiDB Cloud → Create → **Starter** (or any MySQL 8 host such as Aiven).
-2. On Vercel: **Add New → Project**, import this repo, keep the root directory.
-3. Add environment variables:
-
-   | Name | Value |
-   |---|---|
-   | `DATABASE_URL` | `mysql://USER:PASSWORD@HOST:4000/payledger` |
-   | `JWT_SECRET` | a long random string (`openssl rand -base64 48`) |
-   | `DB_SSL` | `true` |
-   | `DB_CA_CERT` | only if your provider uses its own certificate authority (Aiven does, TiDB does not) |
-
-4. Deploy. The build runs `npm run migrate` (creates the database and tables), `npm run seed`
-   (demo account, safe to repeat) and builds the React app. `/api/*` runs as a serverless function.
-
-**MySQL vs TiDB.** Tests and benchmarks run on MySQL 8. The same code runs on TiDB: the schema adds
-`AUTO_ID_CACHE=1` inside TiDB-only comments so ids stay in insert order (needed for cursor paging),
-and idempotency replays use `FOR UPDATE` because TiDB does not support `FOR SHARE`.
+Tests and benchmarks run on MySQL 8. The same code runs on TiDB: the schema adds `AUTO_ID_CACHE=1` in TiDB-only
+comments so ids stay in insert order (needed for cursor paging), and idempotency replays use `FOR UPDATE`
+because TiDB does not support `FOR SHARE`.
 
 ## Project layout
 
 ```
-api/index.js            Vercel entry → Express app
-server/src/             app.js, auth.js, walletRoutes.js, payments.js, idempotency.js, db.js, money.js
-server/db/schema.sql    tables, constraints, indexes
-server/scripts/         migrate, seed, reconcile, race-demo, benchmark
-server/tests/           Vitest + Supertest
-web/src/                React app (App.jsx, api.js, styles.css)
-docs/                   DESIGN.md, INTERVIEW_PREP.md, screenshots
+api/index.js           Vercel entry → Express app
+server/src/            app, auth, walletRoutes, payments, idempotency, db, money
+server/db/schema.sql   tables, constraints, indexes
+server/scripts/        migrate, seed, reconcile, race-demo, benchmark
+server/tests/          Vitest + Supertest
+web/src/               React app
+docs/                  DESIGN.md, screenshots
 ```
 
-## What I would add next
+## Next steps
 
-- Transaction **reversals/refunds** as new ledger entries (never edits to old ones).
-- A real payment gateway (Razorpay) with signed **webhooks** for top-ups.
-- Refresh tokens and 2-step verification for large transfers.
-- A shared rate limiter (Redis) — the current one is per process.
-- Expire idempotency keys after 24 hours with a scheduled cleanup job.
+- Refunds and reversals as new ledger entries (never edits to old ones)
+- A real payment gateway (Razorpay) with signed webhooks for top-ups
+- Refresh tokens, and a second verification step for large transfers
+- A shared rate limiter in Redis (the current one is per process)
+- Expire idempotency keys after 24 hours with a scheduled job
+
+---
+
+Built by [Asmitha A G](https://github.com/assmitha2004) · [LinkedIn](https://linkedin.com/in/asmitha-a-g)
