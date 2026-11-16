@@ -41,7 +41,11 @@ export async function apiRequest(path, { method = 'GET', body, idempotencyKey } 
   try {
     response = await fetch(`/api${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
   } catch {
-    throw new NetworkError('Could not reach the server. Your payment may or may not have gone through — retrying is safe.');
+    throw new NetworkError(
+      idempotencyKey
+        ? 'Could not reach the server. Your payment may or may not have gone through — retrying is safe.'
+        : 'Could not reach the server. Check your connection and try again.',
+    );
   }
   const data = await response.json().catch(() => null);
   if (!response.ok) throw new ApiError(response.status, data);
